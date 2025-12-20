@@ -156,7 +156,12 @@ def compute_approx_kl(
     ref_log_probs: torch.Tensor,
     action_mask: Optional[torch.Tensor] = None,
 ):
+    """
+    它计算的是 KL 散度的对数比值部分（log ratio），这是计算 KL 散度的一个关键中间步骤。
 
+    对应公式中的β * KL(π_old(⋅∣st), π_θ(⋅∣st))中的KL数值部分，也就是对数比值部分（log ratio）
+    
+    """
     log_ratio = log_probs.float() - ref_log_probs.float()
     if action_mask is not None:
         log_ratio = log_ratio * action_mask
@@ -175,22 +180,35 @@ def get_advantages_and_returns(
         gamma: float,
         lambd: float):
     
-    lastgaelam = 0
-    advantages_reversed = []
+    lastgaelam = 0  # 存储递归计算的GAE值，初始化为0
+    advantages_reversed = []  # 用于存储反向计算的优势值（从序列末尾开始）
     response_length = rewards.size(1)
     
     if action_mask is not None:
         values = action_mask * values
         rewards = action_mask * rewards
 
+    
     for t in reversed(range(response_length)):
+        """
+        计算TD误差，δt = rt + γV(st+1) − V(st)
+        V(st+1) 即为 nextvalues
+        δt 即为 delta
+        """
         nextvalues = values[:, t + 1] if t < response_length - 1 else 0.0
         delta = rewards[:, t] + gamma * nextvalues - values[:, t]
+        """
+        计算GAE优势函数，只能从后往前算，这就是反向传播
+        (At)^GAE(γ,λ) = ∑ l=0~∞ (γλ)^l * δ_t+l
+        At表示在时间步 t 的优势函数，每个时间步 t 都有自己独立的优势值。在时间步 t，优势函数考虑从 t 开始的未来所有信息
+        """
         lastgaelam = delta + gamma * lambd * lastgaelam
         advantages_reversed.append(lastgaelam)
+
     advantages = torch.stack(advantages_reversed[::-1], dim=1)
     returns = advantages + values
-    return advantages.detach(), returns
+    # .detach()和with torch.no_grad()的用处一样，都是让所有张量不再变化，固定住。
+    return advantages.detach(), returns  # ai说这里的.detach()不再必要，因为已经在这个方法外使用了with torch.no_grad()
 
 def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size):
     samples_list = []
@@ -297,23 +315,39 @@ def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_p
     return samples_list
 
 
-def compute_rewards(kl, r, action_mask, kl_ctl, clip_reward_value):#
+def compute_rewards(kl, r, action_mask, kl_ctl, clip_reward_value):
+    """
+    加入奖励裁剪和KL惩罚
 
-        kl_divergence_estimate = -kl_ctl * kl
-        rewards = kl_divergence_estimate
+    # 输入参数：
+    # kl: [batch_size, seq_len] - 每个token的KL散度
+    # r: [batch_size, 1] - 序列级奖励（每个序列一个标量）
+    # action_mask: [batch_size, seq_len] - 标记生成的token
+    # kl_ctl: 标量 - KL惩罚系数
+    # clip_reward_value: float标量或tensor标量 - 奖励裁剪阈值
 
-        ends = action_mask.sum(1) + 1
-        
-        if not isinstance(clip_reward_value, torch.Tensor):
-            clip_reward_value = torch.tensor(clip_reward_value).to(r.device)
+    输出参数rewards：[batch_size, seq_len]
+    KL惩罚应用于所有位置，但只有rewards[-1]是这条轨迹的奖励。
+    """
+
+    kl_divergence_estimate = -kl_ctl * kl  # KL惩罚项
+    rewards = kl_divergence_estimate
+
+    ends = action_mask.sum(1) + 1  # 找到有效位的末尾
     
-        reward_clip = torch.clamp(r, -clip_reward_value,
-                                  clip_reward_value)
-        batch_size = r.size(0)
-        for j in range(batch_size):
-            rewards[j, :ends[j]][-1] += reward_clip[j, 0]
+    if not isinstance(clip_reward_value, torch.Tensor):
+        clip_reward_value = torch.tensor(clip_reward_value).to(r.device)  # 从float -> torch标量，但本质还是数值标量0.2
 
-        return rewards
+    # reward_clip对应公式中的 Ψ_t（奖励信号）项；r是原始奖励
+    reward_clip = torch.clamp(r, -clip_reward_value,
+                                clip_reward_value)  # clip操作
+    batch_size = r.size(0)
+
+    # 每一个轨迹中，每个token位置都根据其KL散度大小受到相应的惩罚，但只有末尾token才附上轨迹的完整奖励。
+    for j in range(batch_size):
+        rewards[j, :ends[j]][-1] += reward_clip[j, 0]  # 第j行的有效列，这个序列的末尾加上裁剪后的奖励值。
+
+    return rewards  # 
 
 def generate_experiences(samples_list):
     # 这段代码将所有模型切换到评估/推理模式，是强化学习经验收集阶段的关键准备步骤。
@@ -422,7 +456,7 @@ def generate_experiences(samples_list):
             # 计算奖励模型的奖励值
             reward_model_inputs = reward_tokenizer(seq_texts, return_tensors="pt", padding=True)
             r = reward_model(**reward_model_inputs.to(device)).logits # 奖励模型的输出，相当于生成最后一个token的奖励（结果奖励模型）
-            # 计算kl散度
+            # 计算kl散度   KL值：两个模型在相同输入下，生成概率分布的差异程度，颗粒度为token
             kl = compute_approx_kl(
                     action_log_probs,
                     ref_action_log_probs,
@@ -431,8 +465,6 @@ def generate_experiences(samples_list):
             rewards = compute_rewards(kl, r, action_mask, kl_ctl=0.1, clip_reward_value=0.2)
             # 计算优势和回报
             advantages, returns = get_advantages_and_returns(value, rewards, action_mask, gamma=0.1, lambd=0.2)
-        # actor_model.train()
-        # critic_model.train()
 
         experiences.append(Experience(seqs,
                     action_log_probs.detach(),
@@ -463,7 +495,51 @@ class BufferItem:
     num_actions: Union[int, torch.Tensor]
 
 def collate_fn(batch):
+    """
+    通俗理解：分拣机器人，将每个包裹中的相同物品（字段）收拢在一起，方便后续批量处理。
 
+    自定义批次合并函数，用于将多个经验样本合并为一个训练批次。
+    
+    该函数专为PPO训练设计，将Experience对象列表转换为统一的BufferItem批次，
+    用于高效的策略和价值网络更新。与PyTorch默认collate不同，此函数针对
+    RLHF训练特点进行优化，确保所有张量在批次维度正确对齐。
+    
+    Args:
+        batch (List[Dict]): 一批经验样本，每个样本是包含以下字段的字典：
+            - 'seqs': 输入token序列，形状为[seq_len]或[1, seq_len]
+            - 'action_log_probs': 旧策略的动作对数概率，形状为[num_actions]
+            - 'values': 评论家模型估计的状态价值，形状为[num_actions]
+            - 'returns': 计算得到的目标回报值，形状为[num_actions]
+            - 'advantages': 优势函数值，形状为[num_actions]
+            - 'attention_mask': 注意力掩码，形状为[seq_len]
+            - 'action_mask': 动作掩码（区分prompt和response），形状为[num_actions]
+    
+    Returns:
+        BufferItem: 包含批次化经验数据的对象，具有以下属性：
+            - seqs: 合并后的token序列，形状为[batch_size, max_seq_len]
+            - action_log_probs: 合并后的动作对数概率，形状为[batch_size, max_num_actions]
+            - values: 合并后的状态价值，形状为[batch_size, max_num_actions]
+            - returns: 合并后的目标回报，形状为[batch_size, max_num_actions]
+            - advantages: 合并后的优势函数值，形状为[batch_size, max_num_actions]
+            - attention_mask: 合并后的注意力掩码，形状为[batch_size, max_seq_len]
+            - action_mask: 合并后的动作掩码，形状为[batch_size, max_num_actions]
+            - max_sequence_len: 序列的最大长度，用于优化计算
+    
+    Note:
+        此函数假设批次中的所有样本已经通过ExperienceBuffer进行了适当的填充和对齐。
+        主要优势在于：
+        1. 避免了默认collate函数的递归处理开销
+        2. 确保所有RLHF特定字段正确合并
+        3. 提供了额外的序列长度信息，用于优化后续计算
+        4. 通过显式拼接控制内存布局，提高训练效率
+        
+    Example:
+        >>> # 假设batch包含8个样本
+        >>> batch_item = collate_fn(batch)
+        >>> print(batch_item.seqs.shape)  # torch.Size([8, 512])
+        >>> print(batch_item.advantages.shape)  # torch.Size([8, 128])
+        >>> print(batch_item.max_sequence_len)  # 512
+    """
     seqs = []
     action_log_probs = []
     values = []
@@ -492,11 +568,61 @@ def collate_fn(batch):
     return BufferItem(seqs, action_log_probs, values, returns, advantages, attention_mask, action_mask, action_mask.size(1))
     
 def train_step(experience, steps):
+    """
+    执行单次PPO训练步骤，更新actor策略网络和critic价值网络。
     
-    actor_model.train()
-    optimizer_actor.zero_grad()
+    该函数实现了PPO算法的核心训练逻辑，包括：
+    1. 使用重要性采样和优势函数更新策略网络(actor)
+    2. 使用TD(λ)目标更新价值网络(critic)
+    
+    Args:
+        experience (BufferItem): 包含批次化经验数据的对象，包含以下关键字段：
+            - seqs: 输入token序列 [batch_size, seq_len]
+            - action_log_probs: 旧策略的动作对数概率 [batch_size, num_actions]
+            - advantages: 优势函数值 [batch_size, num_actions]
+            - num_actions: 每个序列中生成的动作数量
+            - attention_mask: 注意力掩码，标识有效token
+            - action_mask: 动作掩码，区分prompt和生成内容
+            - values: 旧价值网络估计的状态价值 [batch_size, num_actions]
+            - returns: 计算得到的目标回报值 [batch_size, num_actions]
+        steps (int): 全局训练步数，用于:
+            - TensorBoard日志记录
+            - 学习率调度
+            - KL系数自适应调整
+    
+    Process Flow:
+        1. Actor网络更新:
+           a. 获取当前策略对序列的预测logits
+           b. 计算新策略的动作对数概率
+           c. 通过重要性采样计算策略损失
+           d. 反向传播并更新actor参数
+        
+        2. Critic网络更新:
+           a. 获取当前价值网络对状态的估计
+           b. 计算价值网络预测与目标回报的MSE损失
+           c. 反向传播并更新critic参数
+    
+    Note:
+        - Actor和Critic采用**分离优化器**，允许不同学习率和参数更新策略
+        - 使用**两阶段训练**（先actor后critic），避免梯度干扰
+        - 通过TensorBoard记录关键指标，便于监控训练过程
+        - 采用**批处理**方式提高训练效率和稳定性
+    
+    Example:
+        >>> # 假设已收集一批经验
+        >>> experiences = generate_experiences(samples)
+        >>> buffer.append(experiences)
+        >>> dataloader = DataLoader(buffer, batch_size=4, collate_fn=collate_fn)
+        >>> for experience in dataloader:
+        ...     train_step(experience, global_steps)
+        ...     global_steps += 1
+    """
+    
+    # ====== 1. 准备Actor模型训练 ======
+    actor_model.train()  # 设置为训练模式，启用dropout和batch norm
+    optimizer_actor.zero_grad()  # 清零梯度，防止历史梯度累积
 
-    
+    # 从经验中提取关键数据
     sequences = experience.seqs
     old_action_log_probs = experience.action_log_probs
     advantages = experience.advantages
@@ -506,28 +632,47 @@ def train_step(experience, steps):
     old_values = experience.values
     returns = experience.returns
     
+    # ====== 2. 计算当前策略的动作概率 ======
+    # 前向传播获取模型预测的logits
     logits = actor_model(
             sequences,
             attention_mask=attention_mask).logits
     
+    # 计算所有位置token的对数概率分布
     log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
+    # 提取序列中实际生成的token对应的对数概率
     log_probs_labels = log_probs.gather(dim=-1, index=sequences[:, 1:].unsqueeze(-1))
+    # 仅保留回答部分（最后num_actions个token）的对数概率
     action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
   
-
-    
-    policy_loss = compute_policy_loss(action_log_probs, old_action_log_probs, advantages,action_mask=action_mask)
+    # ====== 3. 计算并更新策略网络 ======
+    # 计算PPO策略损失（包含重要性采样和clipping机制）
+    policy_loss = compute_policy_loss(action_log_probs, old_action_log_probs, advantages, action_mask=action_mask)
+    # 反向传播计算梯度
     policy_loss.backward()
+    # 应用梯度更新actor参数
     optimizer_actor.step()  
+    # 记录策略损失到TensorBoard，便于监控训练过程
     writer.add_scalar("policy_loss", policy_loss.item(), steps)
     
-    critic_model.train()
-    optimizer_critic.zero_grad()
+    # ====== 4. 准备Critic模型训练 ======
+    critic_model.train()  # 设置为训练模式
+    optimizer_critic.zero_grad()  # 清零critic梯度
+    
+    # ====== 5. 计算并更新价值网络 ======
+    # 前向传播获取当前价值估计
     values = critic_model.forward(sequences, attention_mask, num_actions)
+    # 计算价值网络的MSE损失
     value_loss = compute_value_loss(values, old_values, returns, action_mask)
+    # 反向传播计算梯度
     value_loss.backward()
+    # 应用梯度更新critic参数
     optimizer_critic.step()
+    # 记录价值损失到TensorBoard
     writer.add_scalar("value_loss", value_loss.item(), steps)
+    
+    # ====== 6. 训练状态输出 ======
+    # 打印当前训练步的状态，便于实时监控
     print(f"step: {steps}  policy_loss: {policy_loss.item():.4f}  value_loss: {value_loss.item():.4f}")
     
 
@@ -542,8 +687,10 @@ def train():
             # 生成经验（获取优势、奖励、回报等）
             experiences = generate_experiences(samples)
             buffer.append(experiences)
-            dataloader = DataLoader(buffer, batch_size=micro_train_batch_size, shuffle=True, collate_fn=collate_fn)
-            torch.cuda.empty_cache()
+            # shuffle=True: 随机打乱经验，防止模型记住顺序
+            # collate_fn=collate_fn: 用"分拣机器人"整理数据
+            dataloader = DataLoader(buffer, batch_size=micro_train_batch_size, shuffle=True, collate_fn=collate_fn)  
+            torch.cuda.empty_cache()  # 清理GPU内存
             for epoch in range(max_epochs):
                 for experience in dataloader:
                     train_step(experience, steps)
